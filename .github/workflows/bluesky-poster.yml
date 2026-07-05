@@ -1,0 +1,76 @@
+name: Bluesky Auto Poster
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 4× per day; each run lasts up to 6 hours then restarts
+  workflow_dispatch:
+    inputs:
+      account_row:
+        description: "Which account row to use from Sheet1 (1 = first account)"
+        default: "1"
+        type: choice
+        options: ["1", "2", "3", "4", "5"]
+      post_plan_sheet_name:
+        description: "Post-plan tab name (File Name / Caption / Status)"
+        default: "Sheet1"
+      image_ratio:
+        description: "Image post % (e.g. 60)"
+        default: "60"
+      video_ratio:
+        description: "Video post % (e.g. 40)"
+        default: "40"
+      hashtags_enabled_image:
+        description: "Hashtags on image posts?"
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      hashtags_enabled_video:
+        description: "Hashtags on video posts?"
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      max_image_mb:
+        description: "Max image size in MB before compression"
+        default: "2"
+      enable_report:
+        description: "Generate follower + top-5 posts report?"
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow
+      - name: Run poster loop
+        run: python -u postnow_status_post.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          # ── Only ONE secret needed — everything else comes from the sheet ──
+          GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+          # ── Per-run settings (workflow input → repo Variable → default) ──
+          ACCOUNT_ROW:            ${{ github.event.inputs.account_row            || vars.ACCOUNT_ROW            || '1' }}
+          POST_PLAN_SHEET_NAME:   ${{ github.event.inputs.post_plan_sheet_name   || vars.POST_PLAN_SHEET_NAME   || 'Sheet1' }}
+          IMAGE_RATIO:            ${{ github.event.inputs.image_ratio            || vars.IMAGE_RATIO            || '60' }}
+          VIDEO_RATIO:            ${{ github.event.inputs.video_ratio            || vars.VIDEO_RATIO            || '40' }}
+          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
+          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
+          MAX_IMAGE_MB:           ${{ github.event.inputs.max_image_mb           || vars.MAX_IMAGE_MB           || '2' }}
+          ENABLE_REPORT:          ${{ github.event.inputs.enable_report          || vars.ENABLE_REPORT          || 'false' }}
+      - name: Disable workflow on permanent failure (ban / bad creds)
+        if: failure()
+        run: gh workflow disable "${{ github.workflow }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
