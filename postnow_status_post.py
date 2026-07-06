@@ -600,6 +600,23 @@ def _download_file(service, file_id, local_path):
             _, done = dl.next_chunk()
 
 
+# File-extension → media kind mapping.
+# Drive API mimeType can be unreliable (depends on how the file was uploaded),
+# so we detect kind from the filename extension which is always trustworthy.
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv", ".3gp", ".ts"}
+
+
+def _kind_from_filename(filename):
+    """Return 'image', 'video', or None based on the file extension."""
+    ext = os.path.splitext(filename.lower())[1]
+    if ext in _IMAGE_EXTS:
+        return "image"
+    if ext in _VIDEO_EXTS:
+        return "video"
+    return None
+
+
 def fetch_media_matching_plan(preferred_kind, plan):
     """Find the newest unclaimed Drive file that:
       - is in the upload folder
@@ -614,7 +631,7 @@ def fetch_media_matching_plan(preferred_kind, plan):
     if not folder_id:
         raise RuntimeError("UPLOAD_FOLDER_ID is empty in credentials sheet.")
 
-    # Explicitly request mimeType so Drive API always returns it
+    # Explicitly request the fields we need (mimeType kept for logging only)
     results = service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         orderBy="createdTime desc",
@@ -626,12 +643,11 @@ def fetch_media_matching_plan(preferred_kind, plan):
         print("Upload folder is empty.")
         return None, None, None, None, None
 
-    mime_prefix    = f"{preferred_kind}/"
     skipped_claim  = skipped_plan = skipped_posted = skipped_mime = 0
 
     for file in files:
         name      = file.get("name", "")
-        mime_type = file.get("mimeType", "")
+        mime_type = file.get("mimeType", "unknown")   # only used for logging now
 
         if name.startswith(CLAIM_PREFIX):
             skipped_claim += 1
@@ -640,15 +656,24 @@ def fetch_media_matching_plan(preferred_kind, plan):
         entry = find_plan_entry(plan, name)
         if entry is None:
             skipped_plan += 1
-            continue   # not in post-plan sheet
+            continue
 
         if entry["status"].lower() == POSTED_STATUS_VALUE:
             skipped_posted += 1
             continue
 
-        if not mime_type.startswith(mime_prefix):
+        # ── Detect kind from file extension (more reliable than Drive mimeType) ──
+        file_kind = _kind_from_filename(name)
+        if file_kind is None:
+            # Unknown extension — fall back to mimeType prefix
+            if mime_type.startswith("image/"):
+                file_kind = "image"
+            elif mime_type.startswith("video/"):
+                file_kind = "video"
+
+        if file_kind != preferred_kind:
             skipped_mime += 1
-            continue   # wrong kind this cycle
+            continue
 
         caption    = entry["caption"]
         row_number = entry["row"]
