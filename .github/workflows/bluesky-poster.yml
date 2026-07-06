@@ -26,9 +26,6 @@ on:
         default: "false"
         type: choice
         options: ["true", "false"]
-      max_image_mb:
-        description: "Max image size in MB before compression (Bluesky's hard limit is ~0.93 MB — keep this at or below that)"
-        default: "0.9"
       enable_report:
         description: "Generate follower + top posts report?"
         default: "false"
@@ -67,7 +64,6 @@ jobs:
           VIDEO_RATIO:            ${{ github.event.inputs.video_ratio            || vars.VIDEO_RATIO            || '40' }}
           HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
           HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
-          MAX_IMAGE_MB:           ${{ github.event.inputs.max_image_mb           || vars.MAX_IMAGE_MB           || '0.9' }}
           ENABLE_REPORT:          ${{ github.event.inputs.enable_report          || vars.ENABLE_REPORT          || 'false' }}
           TOP_POSTS_COUNT:        ${{ github.event.inputs.top_posts_count        || vars.TOP_POSTS_COUNT        || '5' }}
           TOP_POSTS_WITHIN:       ${{ github.event.inputs.top_posts_within       || vars.TOP_POSTS_WITHIN       || '30' }}
