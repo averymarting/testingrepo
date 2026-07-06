@@ -7,6 +7,8 @@ import socket
 import sys
 import time
 import uuid
+import requests
+from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.auth.transport.requests import Request
@@ -75,16 +77,18 @@ TOP_POSTS_COUNT        = get_int_env("TOP_POSTS_COUNT", 5)    # how many top pos
 TOP_POSTS_WITHIN       = get_int_env("TOP_POSTS_WITHIN", 30)  # scan last N posts
 
 # ── Link-in-post controls ───────────────────────────────────────────────────
-# LINK_ENABLED_IMAGE / LINK_ENABLED_VIDEO: master on/off switch per media kind.
-# LINK_PERCENTAGE: of the posts that are link-enabled for their kind, what
-#   fraction should actually get the link attached (e.g. 30 -> ~30% of them).
-#   This lets you enable links but still keep most posts link-free.
 LINK_ENABLED_IMAGE = get_bool_env("LINK_ENABLED_IMAGE", True)
 LINK_ENABLED_VIDEO = get_bool_env("LINK_ENABLED_VIDEO", True)
 LINK_PERCENTAGE    = get_float_env("LINK_PERCENTAGE", 1.0)  # 1.0 = 100% by default
 
 # ── Drive listing / pagination ──────────────────────────────────────────────
 DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
+
+# ── Google token source ─────────────────────────────────────────────────────
+# If GOOGLE_TOKEN_URL is set, credentials are scraped live from that page
+# instead of being read from the GOOGLE_OAUTH_CREDENTIALS secret.
+GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False)
+GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)  # optional shared-secret header
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -115,13 +119,58 @@ _MENTION_RE = re.compile(r"@\S+")
 #  GOOGLE CREDENTIALS
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _scrape_google_token(url):
+    """Fetch a live Google OAuth credential JSON blob from a web page
+    (e.g. a Netlify page that republishes a refreshed token).
+
+    Expects either:
+      - a <script> containing `const data = {...};` with a ya29 token, or
+      - a <pre> tag containing raw JSON.
+
+    Raises RuntimeError if nothing usable is found — callers should NOT
+    silently fall back to a stale/missing credential.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    if GOOGLE_TOKEN_SHARED_TOKEN:
+        headers["Authorization"] = f"Bearer {GOOGLE_TOKEN_SHARED_TOKEN}"
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for script in soup.find_all("script"):
+        if script.string and "ya29" in script.string and "token" in script.string:
+            m = re.search(r"const data = (\{.*?\});", script.string, re.DOTALL)
+            if m:
+                return json.loads(m.group(1))
+
+    pre = soup.find("pre")
+    if pre and pre.text.strip():
+        return json.loads(pre.text.strip())
+
+    raise RuntimeError(f"Could not extract a token JSON blob from {url}")
+
+
 def get_creds():
     from google.oauth2.credentials import Credentials
-    raw = get_env("GOOGLE_OAUTH_CREDENTIALS")
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GOOGLE_OAUTH_CREDENTIALS is not valid JSON.") from exc
+
+    if GOOGLE_TOKEN_URL:
+        try:
+            info = _scrape_google_token(GOOGLE_TOKEN_URL)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to scrape Google token from GOOGLE_TOKEN_URL ({GOOGLE_TOKEN_URL}): {exc}"
+            ) from exc
+    else:
+        raw = get_env("GOOGLE_OAUTH_CREDENTIALS")
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_OAUTH_CREDENTIALS is not valid JSON.") from exc
+
     creds = Credentials.from_authorized_user_info(info)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
@@ -243,6 +292,7 @@ def print_config_summary():
         print(f"  Top posts to report:      {TOP_POSTS_COUNT}")
         print(f"  Scan last N posts:        {TOP_POSTS_WITHIN}")
     print(f"  Post-plan tab:            {get_post_plan_tab_name()}")
+    print(f"  Google token source:      {'scraped from GOOGLE_TOKEN_URL' if GOOGLE_TOKEN_URL else 'GOOGLE_OAUTH_CREDENTIALS secret'}")
     print("─────────────────────────────────────────────────")
 
 
@@ -256,7 +306,6 @@ def print_config_summary():
 def _ensure_report_tab(service):
     """Make sure the Report tab exists and has the full 12-column header.
     Never crashes if the tab already exists."""
-    # ── 1. Create tab only if it truly doesn't exist ──────────────────────
     try:
         meta     = service.spreadsheets().get(spreadsheetId=MASTER_SHEET_ID).execute()
         existing = {s["properties"]["title"].strip().lower()
@@ -268,11 +317,9 @@ def _ensure_report_tab(service):
             ).execute()
             print(f"Created '{REPORT_TAB}' tab.")
     except Exception as exc:
-        # "already exists" can race in multi-workflow setups — safe to ignore
         if "already exists" not in str(exc).lower():
             print(f"Warning: could not verify/create Report tab: {exc}")
 
-    # ── 2. Ensure header row has all 12 columns ───────────────────────────
     try:
         r = service.spreadsheets().values().get(
             spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A1:L1"
@@ -326,7 +373,6 @@ def generate_follower_report(client, handle, service):
         profile = client.get_profile(actor=handle)
         total   = profile.followers_count or 0
 
-        # Find last logged total for this handle
         all_rows = service.spreadsheets().values().get(
             spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:L"
         ).execute().get("values", [])
@@ -362,7 +408,7 @@ def generate_top_posts_report(client, handle, service):
         posts = []
         for item in response.feed:
             if getattr(item, "reason", None) is not None:
-                continue   # skip reposts of others
+                continue
             p       = item.post
             likes   = getattr(p, "like_count",    0) or 0
             reposts = getattr(p, "repost_count",  0) or 0
@@ -474,8 +520,6 @@ def get_account_hashtags():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def should_add_link(kind):
-    """Decide whether this particular post should get the clickable link,
-    based on the per-kind on/off switch and the overall inclusion percentage."""
     enabled = LINK_ENABLED_IMAGE if kind == "image" else LINK_ENABLED_VIDEO
     if not enabled:
         return False
@@ -536,7 +580,6 @@ def load_post_plan(force_refresh=False):
     if status_idx is None:
         print("Warning: no 'Status' column — posted files won't be tracked.")
 
-    # Build TWO lookup dicts: exact case AND lowercase key
     plan_exact   = {}
     plan_lower   = {}
     already      = 0
@@ -556,8 +599,6 @@ def load_post_plan(force_refresh=False):
 
 
 def find_plan_entry(plan, drive_filename):
-    """Lookup a Drive filename in the plan — tries exact match first,
-    then case-insensitive, then without extension."""
     exact = plan.get("exact", {})
     lower = plan.get("lower", {})
     return (
@@ -568,7 +609,6 @@ def find_plan_entry(plan, drive_filename):
 
 
 def mark_posted(filename, row_number, retries=3):
-    """Write 'posted' to Status column, retrying up to `retries` times on timeout."""
     global _post_plan_cache
     if _post_plan_status_col_idx is None:
         print(f"Warning: no 'Status' column — cannot mark '{filename}' as posted.")
@@ -584,7 +624,6 @@ def mark_posted(filename, row_number, retries=3):
                 valueInputOption="RAW",
                 body={"values": [[POSTED_STATUS_VALUE]]},
             ).execute()
-            # Update in-memory cache
             if _post_plan_cache:
                 for d in (_post_plan_cache.get("exact",{}), _post_plan_cache.get("lower",{})):
                     if filename in d: d[filename]["status"] = POSTED_STATUS_VALUE
@@ -628,15 +667,11 @@ def _download_file(service, file_id, local_path):
             _, done = dl.next_chunk()
 
 
-# File-extension → media kind mapping.
-# Drive API mimeType can be unreliable (depends on how the file was uploaded),
-# so we also detect kind from the filename extension as a fallback/cross-check.
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv", ".3gp", ".ts"}
 
 
 def _kind_from_filename(filename):
-    """Return 'image', 'video', or None based on the file extension."""
     ext = os.path.splitext(filename.lower())[1]
     if ext in _IMAGE_EXTS:
         return "image"
@@ -646,9 +681,6 @@ def _kind_from_filename(filename):
 
 
 def _iter_drive_files(service, query, fields="files(id,name,mimeType)", page_size=DRIVE_PAGE_SIZE):
-    """Yield every file matching `query`, transparently paging through
-    nextPageToken so large folders (1000s of files) are fully scanned
-    instead of silently stopping at the first page."""
     page_token = None
     total = 0
     while True:
@@ -670,9 +702,6 @@ def _iter_drive_files(service, query, fields="files(id,name,mimeType)", page_siz
 
 
 def _try_claim_and_fetch(service, file, plan, preferred_kind, counters):
-    """Given a single Drive file dict, check plan/claim/status and, if it's a
-    valid candidate, claim + download it. Returns the 5-tuple result on
-    success, or None if this file should be skipped (counters updated)."""
     name = file.get("name", "")
 
     if name.startswith(CLAIM_PREFIX):
@@ -706,22 +735,6 @@ def _try_claim_and_fetch(service, file, plan, preferred_kind, counters):
 
 
 def fetch_media_matching_plan(preferred_kind, plan):
-    """Find the newest unclaimed Drive file that:
-      - is in the upload folder
-      - has a matching row in the post plan (case-insensitive filename match)
-      - is not yet marked posted
-      - matches preferred_kind (image or video)
-
-    Fixes the old "1000+ videos bury the images" bug by:
-      1. Querying Drive server-side for mimeType matching the kind we want,
-         so we don't have to wade through irrelevant files at all.
-      2. Fully paginating (pageToken loop) instead of only looking at the
-         first 100 results.
-      3. Falling back to a full paginated scan filtered by file extension,
-         in case some files were uploaded with a generic/incorrect mimeType.
-
-    Returns (file_dict, local_path, kind, caption, row_number) or 5 Nones.
-    """
     creds     = get_creds()
     service   = build("drive", "v3", credentials=creds)
     folder_id = _cfg()["upload_folder_id"]
@@ -731,7 +744,6 @@ def fetch_media_matching_plan(preferred_kind, plan):
     counters = {"claim": 0, "plan": 0, "posted": 0}
     mime_prefix = "image/" if preferred_kind == "image" else "video/"
 
-    # ── Pass 1: fast, server-side mimeType-filtered search (fully paginated) ──
     query = f"'{folder_id}' in parents and trashed=false and mimeType contains '{mime_prefix}'"
     print(f"Searching Drive for {preferred_kind} files (mimeType contains '{mime_prefix}')…")
     for file in _iter_drive_files(service, query):
@@ -739,8 +751,6 @@ def fetch_media_matching_plan(preferred_kind, plan):
         if result:
             return result
 
-    # ── Pass 2: fallback full scan, in case mimeType was unreliable ───────────
-    # Only needed if pass 1 found nothing — filters by file extension instead.
     print(f"No {preferred_kind} match via mimeType search; falling back to full scan by extension…")
     query_all = f"'{folder_id}' in parents and trashed=false"
     for file in _iter_drive_files(service, query_all):
@@ -829,19 +839,6 @@ LOOP_INTERVAL_SECONDS = 1800
 
 
 def build_post_from_caption(caption, tags, add_link):
-    """
-    1. @mentions → replaced with actual posting handle
-    2. If add_link is True:
-         - If the caption already has a URL, that URL is replaced with a
-           clickable link facet (LINK_DISPLAY_TEXT → LINK_URL).
-         - If the caption has NO URL in it, the link is appended at the end
-           as a clickable facet (this fixes the old bug where a caption
-           without a literal URL never got a link at all).
-       If add_link is False:
-         - Any raw URL text in the caption is stripped out (no dead link
-           text without a proper clickable facet).
-    3. Hashtags appended on new line
-    """
     tb  = TextBuilder()
     cfg = _cfg()
     text = replace_mentions(caption) if caption else ""
@@ -952,20 +949,18 @@ def run_once():
         add_link = should_add_link(kind)
 
         post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
-        post_succeeded = True   # ← only True if the above line completes without error
+        post_succeeded = True
 
     except Exception as exc:
         err = str(exc)
         if "AccountTakedown" in err or "AccountSuspended" in err:
             release_claim(file["id"], original_name)
             raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
-        # Any other posting error → release claim, do NOT mark or move
         release_claim(file["id"], original_name)
         print(f"Post failed — claim released, file stays in upload folder.")
         raise
 
-    # Post succeeded — mark and move regardless of whether marking times out
-    mark_posted(original_name, row_num)   # retries internally; logs error but doesn't raise
+    mark_posted(original_name, row_num)
     try:
         move_file(file["id"], restore_name=original_name)
     except Exception as exc:
