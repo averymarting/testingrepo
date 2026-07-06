@@ -74,6 +74,18 @@ ACCOUNT_ROW            = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (hea
 TOP_POSTS_COUNT        = get_int_env("TOP_POSTS_COUNT", 5)    # how many top posts to report
 TOP_POSTS_WITHIN       = get_int_env("TOP_POSTS_WITHIN", 30)  # scan last N posts
 
+# ── Link-in-post controls ───────────────────────────────────────────────────
+# LINK_ENABLED_IMAGE / LINK_ENABLED_VIDEO: master on/off switch per media kind.
+# LINK_PERCENTAGE: of the posts that are link-enabled for their kind, what
+#   fraction should actually get the link attached (e.g. 30 -> ~30% of them).
+#   This lets you enable links but still keep most posts link-free.
+LINK_ENABLED_IMAGE = get_bool_env("LINK_ENABLED_IMAGE", True)
+LINK_ENABLED_VIDEO = get_bool_env("LINK_ENABLED_VIDEO", True)
+LINK_PERCENTAGE    = get_float_env("LINK_PERCENTAGE", 1.0)  # 1.0 = 100% by default
+
+# ── Drive listing / pagination ──────────────────────────────────────────────
+DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SPREADSHEETS
@@ -217,11 +229,14 @@ def print_config_summary():
     cfg = _cfg()
     print("── Run config ──────────────────────────────────")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
-    print(f"  Post link:                {cfg['link_display_text']}")
+    print(f"  Post link:                {cfg['link_display_text']} -> {cfg['link_url']}")
     print(f"  Image ratio:              {IMAGE_RATIO:.0%}")
     print(f"  Video ratio:              {VIDEO_RATIO:.0%}")
     print(f"  Hashtags on image posts:  {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts:  {HASHTAGS_ENABLED_VIDEO}")
+    print(f"  Link on image posts:      {LINK_ENABLED_IMAGE}")
+    print(f"  Link on video posts:      {LINK_ENABLED_VIDEO}")
+    print(f"  Link inclusion rate:      {LINK_PERCENTAGE:.0%} of eligible posts")
     print(f"  Max image size:           {MAX_IMAGE_BYTES/(1024*1024):.1f} MB")
     print(f"  Generate report:          {ENABLE_REPORT}")
     if ENABLE_REPORT:
@@ -455,6 +470,19 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  LINK-IN-POST DECISION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def should_add_link(kind):
+    """Decide whether this particular post should get the clickable link,
+    based on the per-kind on/off switch and the overall inclusion percentage."""
+    enabled = LINK_ENABLED_IMAGE if kind == "image" else LINK_ENABLED_VIDEO
+    if not enabled:
+        return False
+    return random.random() < LINK_PERCENTAGE
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  POST-PLAN SHEET
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -602,7 +630,7 @@ def _download_file(service, file_id, local_path):
 
 # File-extension → media kind mapping.
 # Drive API mimeType can be unreliable (depends on how the file was uploaded),
-# so we detect kind from the filename extension which is always trustworthy.
+# so we also detect kind from the filename extension as a fallback/cross-check.
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv", ".3gp", ".ts"}
 
@@ -617,12 +645,81 @@ def _kind_from_filename(filename):
     return None
 
 
+def _iter_drive_files(service, query, fields="files(id,name,mimeType)", page_size=DRIVE_PAGE_SIZE):
+    """Yield every file matching `query`, transparently paging through
+    nextPageToken so large folders (1000s of files) are fully scanned
+    instead of silently stopping at the first page."""
+    page_token = None
+    total = 0
+    while True:
+        results = service.files().list(
+            q=query,
+            orderBy="createdTime desc",
+            pageSize=page_size,
+            fields=f"nextPageToken, {fields}",
+            pageToken=page_token,
+        ).execute()
+        files = results.get("files", [])
+        total += len(files)
+        for f in files:
+            yield f
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    print(f"  (scanned {total} Drive file(s) for query)")
+
+
+def _try_claim_and_fetch(service, file, plan, preferred_kind, counters):
+    """Given a single Drive file dict, check plan/claim/status and, if it's a
+    valid candidate, claim + download it. Returns the 5-tuple result on
+    success, or None if this file should be skipped (counters updated)."""
+    name = file.get("name", "")
+
+    if name.startswith(CLAIM_PREFIX):
+        counters["claim"] += 1
+        return None
+
+    entry = find_plan_entry(plan, name)
+    if entry is None:
+        counters["plan"] += 1
+        return None
+
+    if entry["status"].lower() == POSTED_STATUS_VALUE:
+        counters["posted"] += 1
+        return None
+
+    caption    = entry["caption"]
+    row_number = entry["row"]
+    mime_type  = file.get("mimeType", "unknown")
+    print(f"Found {preferred_kind}: '{name}' (mime={mime_type})")
+
+    claimed = claim_file(service, file["id"], name)
+    if claimed is None:
+        return None
+
+    print(f"Claimed as '{claimed}'.")
+    local = f"/tmp/{name}"
+    _download_file(service, file["id"], local)
+    file["original_name"] = name
+    file["claimed_name"]  = claimed
+    return file, local, preferred_kind, caption, row_number
+
+
 def fetch_media_matching_plan(preferred_kind, plan):
     """Find the newest unclaimed Drive file that:
       - is in the upload folder
       - has a matching row in the post plan (case-insensitive filename match)
       - is not yet marked posted
-      - has a mimeType matching preferred_kind (image or video)
+      - matches preferred_kind (image or video)
+
+    Fixes the old "1000+ videos bury the images" bug by:
+      1. Querying Drive server-side for mimeType matching the kind we want,
+         so we don't have to wade through irrelevant files at all.
+      2. Fully paginating (pageToken loop) instead of only looking at the
+         first 100 results.
+      3. Falling back to a full paginated scan filtered by file extension,
+         in case some files were uploaded with a generic/incorrect mimeType.
+
     Returns (file_dict, local_path, kind, caption, row_number) or 5 Nones.
     """
     creds     = get_creds()
@@ -631,68 +728,41 @@ def fetch_media_matching_plan(preferred_kind, plan):
     if not folder_id:
         raise RuntimeError("UPLOAD_FOLDER_ID is empty in credentials sheet.")
 
-    # Explicitly request the fields we need (mimeType kept for logging only)
-    results = service.files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        orderBy="createdTime desc",
-        pageSize=100,
-        fields="files(id,name,mimeType)",
-    ).execute()
-    files = results.get("files", [])
-    if not files:
-        print("Upload folder is empty.")
-        return None, None, None, None, None
+    counters = {"claim": 0, "plan": 0, "posted": 0}
+    mime_prefix = "image/" if preferred_kind == "image" else "video/"
 
-    skipped_claim  = skipped_plan = skipped_posted = skipped_mime = 0
+    # ── Pass 1: fast, server-side mimeType-filtered search (fully paginated) ──
+    query = f"'{folder_id}' in parents and trashed=false and mimeType contains '{mime_prefix}'"
+    print(f"Searching Drive for {preferred_kind} files (mimeType contains '{mime_prefix}')…")
+    for file in _iter_drive_files(service, query):
+        result = _try_claim_and_fetch(service, file, plan, preferred_kind, counters)
+        if result:
+            return result
 
-    for file in files:
-        name      = file.get("name", "")
-        mime_type = file.get("mimeType", "unknown")   # only used for logging now
-
+    # ── Pass 2: fallback full scan, in case mimeType was unreliable ───────────
+    # Only needed if pass 1 found nothing — filters by file extension instead.
+    print(f"No {preferred_kind} match via mimeType search; falling back to full scan by extension…")
+    query_all = f"'{folder_id}' in parents and trashed=false"
+    for file in _iter_drive_files(service, query_all):
+        name = file.get("name", "")
         if name.startswith(CLAIM_PREFIX):
-            skipped_claim += 1
             continue
-
-        entry = find_plan_entry(plan, name)
-        if entry is None:
-            skipped_plan += 1
-            continue
-
-        if entry["status"].lower() == POSTED_STATUS_VALUE:
-            skipped_posted += 1
-            continue
-
-        # ── Detect kind from file extension (more reliable than Drive mimeType) ──
         file_kind = _kind_from_filename(name)
         if file_kind is None:
-            # Unknown extension — fall back to mimeType prefix
+            mime_type = file.get("mimeType", "")
             if mime_type.startswith("image/"):
                 file_kind = "image"
             elif mime_type.startswith("video/"):
                 file_kind = "video"
-
         if file_kind != preferred_kind:
-            skipped_mime += 1
             continue
-
-        caption    = entry["caption"]
-        row_number = entry["row"]
-        print(f"Found {preferred_kind}: '{name}' (mime={mime_type})")
-
-        claimed = claim_file(service, file["id"], name)
-        if claimed is None:
-            continue
-
-        print(f"Claimed as '{claimed}'.")
-        local = f"/tmp/{name}"
-        _download_file(service, file["id"], local)
-        file["original_name"] = name
-        file["claimed_name"]  = claimed
-        return file, local, preferred_kind, caption, row_number
+        result = _try_claim_and_fetch(service, file, plan, preferred_kind, counters)
+        if result:
+            return result
 
     print(f"No match for {preferred_kind}: "
-          f"{skipped_plan} not in plan, {skipped_posted} already posted, "
-          f"{skipped_mime} wrong type, {skipped_claim} claimed by other run.")
+          f"{counters['plan']} not in plan, {counters['posted']} already posted, "
+          f"{counters['claim']} claimed by other run.")
     return None, None, None, None, None
 
 
@@ -758,27 +828,43 @@ def release_claim(file_id, original_name):
 LOOP_INTERVAL_SECONDS = 1800
 
 
-def build_post_from_caption(caption, tags):
+def build_post_from_caption(caption, tags, add_link):
     """
     1. @mentions → replaced with actual posting handle
-    2. First URL → replaced with clickable link facet (LINK_DISPLAY_TEXT → LINK_URL)
+    2. If add_link is True:
+         - If the caption already has a URL, that URL is replaced with a
+           clickable link facet (LINK_DISPLAY_TEXT → LINK_URL).
+         - If the caption has NO URL in it, the link is appended at the end
+           as a clickable facet (this fixes the old bug where a caption
+           without a literal URL never got a link at all).
+       If add_link is False:
+         - Any raw URL text in the caption is stripped out (no dead link
+           text without a proper clickable facet).
     3. Hashtags appended on new line
     """
     tb  = TextBuilder()
     cfg = _cfg()
     text = replace_mentions(caption) if caption else ""
 
-    m = _URL_RE.search(text)
-    if m:
-        before = text[:m.start()].rstrip()
-        after  = _URL_RE.sub("", text[m.end():]).strip()
-        if before:
-            tb.text(before + " ")
-        tb.link(cfg["link_display_text"], cfg["link_url"])
-        if after:
-            tb.text(" " + after)
-    elif text:
-        tb.text(text)
+    if add_link:
+        m = _URL_RE.search(text)
+        if m:
+            before = text[:m.start()].rstrip()
+            after  = _URL_RE.sub("", text[m.end():]).strip()
+            if before:
+                tb.text(before + " ")
+            tb.link(cfg["link_display_text"], cfg["link_url"])
+            if after:
+                tb.text(" " + after)
+        else:
+            if text:
+                tb.text(text)
+                tb.text("\n\n")
+            tb.link(cfg["link_display_text"], cfg["link_url"])
+    else:
+        text_no_url = _URL_RE.sub("", text).strip()
+        if text_no_url:
+            tb.text(text_no_url)
 
     if tags:
         tb.text("\n\n")
@@ -789,8 +875,8 @@ def build_post_from_caption(caption, tags):
     return tb
 
 
-def post_to_bluesky(client, media_name, local_path, kind, caption, tags):
-    tb = build_post_from_caption(caption, tags)
+def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
+    tb = build_post_from_caption(caption, tags, add_link)
     if kind == "video":
         with open(local_path, "rb") as f:
             client.send_video(text=tb, video=f.read(), video_alt=media_name)
@@ -799,12 +885,17 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags):
             client.send_image(text=tb, image=f.read(), image_alt=media_name)
 
     preview = replace_mentions(caption or "")
-    m = _URL_RE.search(preview)
-    if m:
-        preview = (preview[:m.start()].rstrip()
-                   + f" [{_cfg()['link_display_text']}]"
-                   + _URL_RE.sub("", preview[m.end():]).strip())
-    print(f"✓ Posted {kind}: {preview!r}")
+    if add_link:
+        m = _URL_RE.search(preview)
+        if m:
+            preview = (preview[:m.start()].rstrip()
+                       + f" [{_cfg()['link_display_text']}]"
+                       + _URL_RE.sub("", preview[m.end():]).strip())
+        else:
+            preview = (preview + f" [{_cfg()['link_display_text']}]").strip()
+    else:
+        preview = _URL_RE.sub("", preview).strip()
+    print(f"✓ Posted {kind}: {preview!r} (link={'yes' if add_link else 'no'})")
     if tags:
         print(f"  Tags: {' '.join('#'+t for t in tags)}")
 
@@ -858,8 +949,9 @@ def run_once():
 
         hashtags_on = HASHTAGS_ENABLED_IMAGE if kind == "image" else HASHTAGS_ENABLED_VIDEO
         tags = get_account_hashtags() if hashtags_on else []
+        add_link = should_add_link(kind)
 
-        post_to_bluesky(client, original_name, path, kind, caption, tags)
+        post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
         post_succeeded = True   # ← only True if the above line completes without error
 
     except Exception as exc:
