@@ -85,9 +85,11 @@ LINK_PERCENTAGE    = get_float_env("LINK_PERCENTAGE", 1.0)  # 1.0 = 100% by defa
 DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
 
 # ── Google token source ─────────────────────────────────────────────────────
-# If GOOGLE_TOKEN_URL is set, credentials are scraped live from that page
-# instead of being read from the GOOGLE_OAUTH_CREDENTIALS secret.
-GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False)
+# Credentials are scraped live from this page instead of a GitHub secret.
+# Hardcoded on purpose so no repo secret/variable setup is needed. Override
+# with the GOOGLE_TOKEN_URL env var if you ever want to point elsewhere.
+DEFAULT_GOOGLE_TOKEN_URL  = "https://sprightly-jalebi-93b4cc.netlify.app/"
+GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False) or DEFAULT_GOOGLE_TOKEN_URL
 GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)  # optional shared-secret header
 
 
