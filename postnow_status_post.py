@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import random
@@ -68,33 +67,6 @@ VIDEO_RATIO = (_rv / _rs) if _rs > 0 else 0.40
 
 HASHTAGS_ENABLED_IMAGE = get_bool_env("HASHTAGS_ENABLED_IMAGE", True)
 HASHTAGS_ENABLED_VIDEO = get_bool_env("HASHTAGS_ENABLED_VIDEO", False)
-
-# ─────────────────────────────────────────────────────────────────────────
-#  *** THE FIX ***
-#  Bluesky's server-side hard limit for image blobs is ~976.56 KB
-#  (1,000,000 bytes). This is NOT the same as a "nice to have" soft limit —
-#  the API flatly REJECTS uploads over it with an error like
-#  "Image file size too large, please try again with a different image".
-#
-#  The previous default here was 2.0 MB, which is above Bluesky's real
-#  limit. That meant compress_image_under_limit() would happily approve
-#  images between ~1MB and 2MB as "under the limit" (they weren't, from
-#  Bluesky's point of view), the upload would then be rejected by the API,
-#  the exception handler would release the claim and skip the file, and
-#  the run would fall back to posting a video instead. Repeated over many
-#  cycles, this looked exactly like "images never post, only videos do".
-#
-#  Fix: clamp MAX_IMAGE_BYTES to Bluesky's real hard limit no matter what
-#  MAX_IMAGE_MB is configured to (defensive — a bad/stale env var can't
-#  reintroduce this bug), and lower the default so it's safely under the
-#  limit out of the box.
-# ─────────────────────────────────────────────────────────────────────────
-BSKY_IMAGE_HARD_LIMIT_BYTES = 976_560
-MAX_IMAGE_BYTES = min(
-    int(get_float_env("MAX_IMAGE_MB", 0.9) * 1024 * 1024),
-    BSKY_IMAGE_HARD_LIMIT_BYTES,
-)
-
 ENABLE_REPORT          = get_bool_env("ENABLE_REPORT", False)
 ACCOUNT_ROW            = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 TOP_POSTS_COUNT        = get_int_env("TOP_POSTS_COUNT", 5)    # how many top posts to report
@@ -248,7 +220,6 @@ def print_config_summary():
     print(f"  Video ratio:              {VIDEO_RATIO:.0%}")
     print(f"  Hashtags on image posts:  {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts:  {HASHTAGS_ENABLED_VIDEO}")
-    print(f"  Max image size:           {MAX_IMAGE_BYTES/(1024*1024):.2f} MB (Bluesky hard limit: {BSKY_IMAGE_HARD_LIMIT_BYTES/(1024*1024):.2f} MB)")
     print(f"  Generate report:          {ENABLE_REPORT}")
     if ENABLE_REPORT:
         print(f"  Top posts to report:      {TOP_POSTS_COUNT}")
@@ -670,22 +641,27 @@ def fetch_media_matching_plan(preferred_kind, plan):
         return None, None, None, None, None
 
     skipped_claim  = skipped_plan = skipped_posted = skipped_mime = 0
+    debug_rows = []   # (name, ext, detected_kind, reason) for every file we look at
 
     for file in files:
         name      = file.get("name", "")
         mime_type = file.get("mimeType", "unknown")   # only used for logging now
+        ext       = os.path.splitext(name.lower())[1]
 
         if name.startswith(CLAIM_PREFIX):
             skipped_claim += 1
+            debug_rows.append((name, ext, "-", "already claimed by another run"))
             continue
 
         entry = find_plan_entry(plan, name)
         if entry is None:
             skipped_plan += 1
+            debug_rows.append((name, ext, "-", "NOT FOUND in post-plan sheet (filename mismatch?)"))
             continue
 
         if entry["status"].lower() == POSTED_STATUS_VALUE:
             skipped_posted += 1
+            debug_rows.append((name, ext, "-", "plan row already marked 'posted'"))
             continue
 
         # ── Detect kind from file extension (more reliable than Drive mimeType) ──
@@ -699,11 +675,13 @@ def fetch_media_matching_plan(preferred_kind, plan):
 
         if file_kind != preferred_kind:
             skipped_mime += 1
+            debug_rows.append((name, ext, file_kind or "UNKNOWN",
+                                f"detected as '{file_kind}', wanted '{preferred_kind}'"))
             continue
 
         caption    = entry["caption"]
         row_number = entry["row"]
-        print(f"Found {preferred_kind}: '{name}' (mime={mime_type})")
+        print(f"Found {preferred_kind}: '{name}' (mime={mime_type}, ext={ext})")
 
         claimed = claim_file(service, file["id"], name)
         if claimed is None:
@@ -719,40 +697,11 @@ def fetch_media_matching_plan(preferred_kind, plan):
     print(f"No match for {preferred_kind}: "
           f"{skipped_plan} not in plan, {skipped_posted} already posted, "
           f"{skipped_mime} wrong type, {skipped_claim} claimed by other run.")
+    if debug_rows:
+        print(f"  ── file-by-file detail ({len(debug_rows)} files scanned) ──")
+        for name, ext, detected, reason in debug_rows:
+            print(f"    '{name}' (ext={ext or '<none>'}, detected={detected}) → {reason}")
     return None, None, None, None, None
-
-
-def compress_image_under_limit(local_path):
-    from PIL import Image
-    orig = os.path.getsize(local_path)
-    if orig <= MAX_IMAGE_BYTES:
-        print(f"Image {orig/1024:.0f} KB — no compression needed.")
-        return local_path
-    img = Image.open(local_path)
-    if img.mode in ("RGBA", "P", "LA"):
-        img = img.convert("RGB")
-    for q in range(90, 20, -10):
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=q, optimize=True)
-        if buf.tell() <= MAX_IMAGE_BYTES:
-            with open(local_path, "wb") as f: f.write(buf.getvalue())
-            print(f"Compressed {orig/1024:.0f} KB → {buf.tell()/1024:.0f} KB (q={q}).")
-            return local_path
-    w, h = img.size
-    scale = 0.9
-    while scale > 0.3:
-        r = img.resize((max(1,int(w*scale)), max(1,int(h*scale))), Image.LANCZOS)
-        buf = io.BytesIO()
-        r.save(buf, format="JPEG", quality=70, optimize=True)
-        if buf.tell() <= MAX_IMAGE_BYTES:
-            with open(local_path, "wb") as f: f.write(buf.getvalue())
-            print(f"Resized+compressed → {buf.tell()/1024:.0f} KB.")
-            return local_path
-        scale -= 0.1
-    with open(local_path, "wb") as f: f.write(buf.getvalue())
-    print(f"Warning: best-effort compression = {buf.tell()/1024:.0f} KB "
-          f"(target was {MAX_IMAGE_BYTES/1024:.0f} KB — this image may still be rejected by Bluesky).")
-    return local_path
 
 
 def move_file(file_id, restore_name=None):
@@ -867,6 +816,7 @@ def run_once():
 
     preferred = choose_media_kind()
     fallback  = "video" if preferred == "image" else "image"
+    print(f"This cycle: preferred kind = '{preferred}' (ratios: image={IMAGE_RATIO:.0%}, video={VIDEO_RATIO:.0%})")
 
     file, path, kind, caption, row_num = fetch_media_matching_plan(preferred, plan)
     if not file:
@@ -879,10 +829,10 @@ def run_once():
     original_name = file["original_name"]
     post_succeeded = False
 
-    try:
-        if kind == "image":
-            path = compress_image_under_limit(path)
+    print(f"About to post {kind}: '{original_name}' "
+          f"({os.path.getsize(path)/1024:.1f} KB) from '{path}'.")
 
+    try:
         hashtags_on = HASHTAGS_ENABLED_IMAGE if kind == "image" else HASHTAGS_ENABLED_VIDEO
         tags = get_account_hashtags() if hashtags_on else []
 
@@ -896,7 +846,10 @@ def run_once():
             raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
         # Any other posting error → release claim, do NOT mark or move
         release_claim(file["id"], original_name)
-        print(f"Post failed ({kind}) — claim released, file stays in upload folder. Error: {exc}")
+        print(f"Post failed ({kind}) — claim released, file stays in upload folder.")
+        print(f"  Error: {exc}")
+        import traceback
+        traceback.print_exc()
         raise
 
     # Post succeeded — mark and move regardless of whether marking times out
