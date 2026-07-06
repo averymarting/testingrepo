@@ -731,7 +731,7 @@ def release_claim(file_id, original_name):
 #  POST BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
 
-LOOP_INTERVAL_SECONDS = 1800
+LOOP_INTERVAL_SECONDS = 120
 
 
 def build_post_from_caption(caption, tags):
