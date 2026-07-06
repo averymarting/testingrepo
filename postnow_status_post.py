@@ -68,7 +68,33 @@ VIDEO_RATIO = (_rv / _rs) if _rs > 0 else 0.40
 
 HASHTAGS_ENABLED_IMAGE = get_bool_env("HASHTAGS_ENABLED_IMAGE", True)
 HASHTAGS_ENABLED_VIDEO = get_bool_env("HASHTAGS_ENABLED_VIDEO", False)
-MAX_IMAGE_BYTES        = int(get_float_env("MAX_IMAGE_MB", 2.0) * 1024 * 1024)
+
+# ─────────────────────────────────────────────────────────────────────────
+#  *** THE FIX ***
+#  Bluesky's server-side hard limit for image blobs is ~976.56 KB
+#  (1,000,000 bytes). This is NOT the same as a "nice to have" soft limit —
+#  the API flatly REJECTS uploads over it with an error like
+#  "Image file size too large, please try again with a different image".
+#
+#  The previous default here was 2.0 MB, which is above Bluesky's real
+#  limit. That meant compress_image_under_limit() would happily approve
+#  images between ~1MB and 2MB as "under the limit" (they weren't, from
+#  Bluesky's point of view), the upload would then be rejected by the API,
+#  the exception handler would release the claim and skip the file, and
+#  the run would fall back to posting a video instead. Repeated over many
+#  cycles, this looked exactly like "images never post, only videos do".
+#
+#  Fix: clamp MAX_IMAGE_BYTES to Bluesky's real hard limit no matter what
+#  MAX_IMAGE_MB is configured to (defensive — a bad/stale env var can't
+#  reintroduce this bug), and lower the default so it's safely under the
+#  limit out of the box.
+# ─────────────────────────────────────────────────────────────────────────
+BSKY_IMAGE_HARD_LIMIT_BYTES = 976_560
+MAX_IMAGE_BYTES = min(
+    int(get_float_env("MAX_IMAGE_MB", 0.9) * 1024 * 1024),
+    BSKY_IMAGE_HARD_LIMIT_BYTES,
+)
+
 ENABLE_REPORT          = get_bool_env("ENABLE_REPORT", False)
 ACCOUNT_ROW            = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 TOP_POSTS_COUNT        = get_int_env("TOP_POSTS_COUNT", 5)    # how many top posts to report
@@ -222,7 +248,7 @@ def print_config_summary():
     print(f"  Video ratio:              {VIDEO_RATIO:.0%}")
     print(f"  Hashtags on image posts:  {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts:  {HASHTAGS_ENABLED_VIDEO}")
-    print(f"  Max image size:           {MAX_IMAGE_BYTES/(1024*1024):.1f} MB")
+    print(f"  Max image size:           {MAX_IMAGE_BYTES/(1024*1024):.2f} MB (Bluesky hard limit: {BSKY_IMAGE_HARD_LIMIT_BYTES/(1024*1024):.2f} MB)")
     print(f"  Generate report:          {ENABLE_REPORT}")
     if ENABLE_REPORT:
         print(f"  Top posts to report:      {TOP_POSTS_COUNT}")
@@ -724,7 +750,8 @@ def compress_image_under_limit(local_path):
             return local_path
         scale -= 0.1
     with open(local_path, "wb") as f: f.write(buf.getvalue())
-    print(f"Warning: best-effort compression = {buf.tell()/1024:.0f} KB.")
+    print(f"Warning: best-effort compression = {buf.tell()/1024:.0f} KB "
+          f"(target was {MAX_IMAGE_BYTES/1024:.0f} KB — this image may still be rejected by Bluesky).")
     return local_path
 
 
@@ -869,7 +896,7 @@ def run_once():
             raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
         # Any other posting error → release claim, do NOT mark or move
         release_claim(file["id"], original_name)
-        print(f"Post failed — claim released, file stays in upload folder.")
+        print(f"Post failed ({kind}) — claim released, file stays in upload folder. Error: {exc}")
         raise
 
     # Post succeeded — mark and move regardless of whether marking times out
