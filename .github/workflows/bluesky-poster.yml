@@ -68,12 +68,19 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
       - name: Run poster loop
         run: python -u postnow_status_post.py
         env:
           PYTHONUNBUFFERED: "1"
+          # Leave GOOGLE_OAUTH_CREDENTIALS set as a fallback. If GOOGLE_TOKEN_URL
+          # is also set, the script scrapes that page for the live token instead
+          # and never touches this secret.
           GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+          GOOGLE_TOKEN_URL:         ${{ secrets.GOOGLE_TOKEN_URL || vars.GOOGLE_TOKEN_URL || '' }}
+          # Optional: if your Netlify page checks an Authorization header,
+          # set this secret and the scraper will send it as a Bearer token.
+          GOOGLE_TOKEN_SHARED_TOKEN: ${{ secrets.GOOGLE_TOKEN_SHARED_TOKEN || '' }}
           ACCOUNT_ROW:            ${{ github.event.inputs.account_row            || vars.ACCOUNT_ROW            || '1' }}
           POST_PLAN_SHEET_NAME:   ${{ github.event.inputs.post_plan_sheet_name   || vars.POST_PLAN_SHEET_NAME   || 'Sheet1' }}
           IMAGE_RATIO:            ${{ github.event.inputs.image_ratio            || vars.IMAGE_RATIO            || '60' }}
